@@ -71,7 +71,7 @@ def grab_data(options):
 
     logging.info("Saving nTuples to " + options.output)
 
-    with open('raw_data.json') as f:
+    with open(options.config) as f:
         locations = json.load(f)
     if options.particles is not None:
         locations =  [sample for sample in locations if sample["particle"] in options.particles]
@@ -99,6 +99,30 @@ def grab_data(options):
                 from IPython import embed
                 embed()
 
+def transform_variables(options):
+    from os import listdir
+    from os.path import isfile, join, splitext
+    from root_pandas import read_root
+
+    rootfiles = [f for f in listdir(options.input) if isfile(join(options.input, f)) and splitext(f)[1] == ".root"]
+    print("Transforming PID variables in files:", rootfiles)
+
+    chunksize = 100000
+    for rootfile in rootfiles:
+        print("Writing {}".format(join(options.output, rootfile)))
+        for i, chunk in enumerate(read_root(join(options.input, rootfile), key="tree", ignore="Charge*", chunksize=chunksize)):
+            for var in chunk.columns:
+                if "ProbNN" in var and "Trafo" not in var:
+                    chunk[var+"_Trafo"] = np.log(chunk[var]/(1-chunk[var]))
+                    #Replace nan-entries (i.e. values outside (0,1) in original distribution) with -1000
+                    nan_entries = np.isnan(chunk[var+"_Trafo"])
+                    chunk[var+"_Trafo"] = chunk[var+"_Trafo"].where(~nan_entries, other=-1000)
+
+            chunk.to_root(join(options.output, rootfile), key="tree", mode="w")
+            logging.info('Processed {} entries'.format((i+1) * chunksize))
+
+
+
 def create_resamplers(options):
     import os.path
     import pickle
@@ -112,11 +136,20 @@ def create_resamplers(options):
         except IOError:
             raise IOError("Failed to load binning scheme file '{scheme_file}'".format(scheme_file=options.binning_file))
 
-    pid_variables = ['{}_CombDLLK', '{}_CombDLLmu', '{}_CombDLLp', '{}_CombDLLe', '{}_V3ProbNNK', '{}_V3ProbNNpi', '{}_V3ProbNNmu', '{}_V3ProbNNp']
+    pid_variables = ['{}_CombDLLK', '{}_CombDLLmu', '{}_CombDLLp', '{}_CombDLLe',
+                    #ProbNN
+                    '{}_V3ProbNNK', '{}_V3ProbNNpi', '{}_V3ProbNNmu', '{}_V3ProbNNp', '{}_V3ProbNNe', '{}_V3ProbNNghost',
+                    '{}_V2ProbNNK', '{}_V2ProbNNpi', '{}_V2ProbNNmu', '{}_V2ProbNNp', '{}_V2ProbNNe', '{}_V2ProbNNghost',
+                    ]
+    if options.use_trafo:
+        pid_variables += [#transformed ProbNN with log( var/(1-var) ) => more stable distribution
+                          '{}_V3ProbNNK_Trafo', '{}_V3ProbNNpi_Trafo', '{}_V3ProbNNmu_Trafo', '{}_V3ProbNNp_Trafo', '{}_V3ProbNNe_Trafo', '{}_V3ProbNNghost_Trafo',
+                          '{}_V2ProbNNK_Trafo', '{}_V2ProbNNpi_Trafo', '{}_V2ProbNNmu_Trafo', '{}_V2ProbNNp_Trafo', '{}_V2ProbNNe_Trafo', '{}_V2ProbNNghost_Trafo'
+                          ]
     kin_variables = ['{}_P', '{}_Eta','nTracks']
 
 
-    with open('raw_data.json') as f:
+    with open(options.config) as f:
         locations = json.load(f)
     if options.particles:
         locations = [sample for sample in locations if sample["particle"] in options.particles]
@@ -124,16 +157,16 @@ def create_resamplers(options):
         locations = [sample for sample in locations if sample["magnet"]=="Up"] # we use both maagnet orientations on the first run
     for sample in locations:
         binning_P = rooBinning_to_list(GetBinScheme(sample['branch_particle'], "P", options.binning_name)) #last argument takes name of user-defined binning
-        binning_ETA = rooBinning_to_list(GetBinScheme(sample['branch_particle'], "ETA", options.binning_name)) #last argument takes name of user-defined binning 
+        binning_ETA = rooBinning_to_list(GetBinScheme(sample['branch_particle'], "ETA", options.binning_name)) #last argument takes name of user-defined binning
         binning_nTracks = rooBinning_to_list(GetBinScheme(sample['branch_particle'], "nTracks", options.binning_name)) #last argument takes name of user-defined binning
-    	if options.both_magnet_orientations:
-            if sample["magnet"]=="Up":  
+        if options.both_magnet_orientations:
+            if sample["magnet"]=="Up":
                 data =  [options.location + '/{particle}_Stripping{stripping}_MagnetUp.root'  .format(**sample)]
                 data += [options.location + '/{particle}_Stripping{stripping}_MagnetDown.root'.format(**sample)]
-                resampler_location = '{particle}_Stripping{stripping}_MagnetAny.pkl'.format(**sample)
+                resampler_location = options.saveto + '/{particle}_Stripping{stripping}_MagnetAny.pkl'.format(**sample)
         else:
             data = [options.location + '/{particle}_Stripping{stripping}_Magnet{magnet}.root'.format(**sample)]
-            resampler_location = '{particle}_Stripping{stripping}_Magnet{magnet}.pkl'.format(**sample)
+            resampler_location = options.saveto + '/{particle}_Stripping{stripping}_Magnet{magnet}.pkl'.format(**sample)
         if os.path.exists(resampler_location):
             os.remove(resampler_location)
         resamplers = dict()
@@ -141,14 +174,23 @@ def create_resamplers(options):
         pids = map(lambda x: x.format(sample['branch_particle']), pid_variables)
         for pid in pids:
             if "DLL" in pid:
-                target_binning = np.linspace(-150, 150, 300) # binning for DLL
+                #Different binnings for different PIDs
+                if "DLLmu" in pid or "DLLe" in pid:
+                    target_binning = np.linspace(-20, 20, 300)
+                else:
+                    target_binning = np.linspace(-150, 150, 300) # binning for DLLK and DLLp
+            elif "ProbNN" in pid and "Trafo" in pid: # binning for transformed ProbNN
+                if "ProbNNe" in pid:    # broader distribution for electrons
+                    target_binning = np.linspace(-35, 20, 300)
+                else:
+                    target_binning = np.linspace(-20, 15, 300)
             elif "ProbNN" in pid:
-                target_binning = np.linspace(0, 1, 100) # binning for ProbNN
+                target_binning = np.linspace(0, 1, 100) # binning for (raw) ProbNN
             else:
                 raise Exception
             resamplers[pid] = Resampler(binning_P, binning_ETA, binning_nTracks, target_binning)
         for dataSet in data:
-            for i, chunk in enumerate(read_root(dataSet, columns=deps + pids + ['nsig_sw'], chunksize=100000, where=options.cutstring)): # where is None if option is not set 
+            for i, chunk in enumerate(read_root(dataSet, columns=deps + pids + ['nsig_sw'], chunksize=100000, where=options.cutstring)): # where is None if option is not set
                 for pid in pids:
                     resamplers[pid].learn(chunk[deps + [pid]].values.T, weights=chunk['nsig_sw'])
                 logging.info('Finished chunk {}'.format(i))
@@ -165,7 +207,7 @@ def resample_branch(options):
         pass
 
     with open(options.configfile) as f:
-        config = json.load(f)   
+        config = json.load(f)
 
     #load resamplers into config dictionary
     for task in config["tasks"]:
@@ -180,13 +222,16 @@ def resample_branch(options):
                     raise
 
     chunksize = 100000
-    for i, chunk in enumerate(read_root(options.source_file, tree_key=options.input_tree, ignore=["*_COV_"], chunksize=chunksize)):
+    for i, chunk in enumerate(read_root(options.source_file, key=options.input_tree, ignore=["*_COV_"], chunksize=chunksize)):
         for task in config["tasks"]:
             deps = chunk[task["features"]]
             for pid in task["pids"]:
                 chunk[pid["name"]] = pid["resampler"].sample(deps.values.T)
-        chunk.to_root(options.output_file, tree_key=options.output_tree, mode="a")
+        chunk.to_root(options.output_file, key=options.output_tree, mode="a")
         logging.info('Processed {} entries'.format((i+1) * chunksize))
+
+
+
 
 
 with open('raw_data.json') as configfile:
@@ -200,6 +245,14 @@ grab = subparsers.add_parser('grab_data', help='Downloads PID calib data from EO
 grab.set_defaults(func=grab_data)
 grab.add_argument('output', help="Directory where grabbed data is being stored.")
 grab.add_argument('--particles', nargs='*', help="Optional subset of particles for which calibration data will be downloaded. Choose from "+", ".join(particle_set))
+grab.add_argument('-c', '--config', default="raw_data.json", help="Config-file with raw_data in it. Default: raw_data.json")
+
+transform = subparsers.add_parser('trafo_variables', help='Transform ProbNN variables in downloaded NTuples according to log(PID_var/(1-PID_var)) and save it with suffix "_Trafo"')
+transform.set_defaults(func=transform_variables)
+transform.add_argument('input', help="Directory where grabbed data is stored (every ProbNN variable in every .root file in this directory will be transformed)")
+transform.add_argument('output', help="Directory where transformed NTuples are stored")
+
+
 
 create = subparsers.add_parser('create_resamplers', help='Generates resampling histograms from NTuples')
 create.set_defaults(func=create_resamplers)
@@ -209,6 +262,11 @@ create.add_argument('--cutstring', help="Optional cutstring. For example you can
 create.add_argument("--merge-magnet-orientations", dest='both_magnet_orientations', action='store_true', default=False, help='Create a resampler that combines the raw data for magup and mag down.')
 create.add_argument("--binning_name", type=str, default=None, help="Parameter to specify a non-default binning.")
 create.add_argument("--binning_file", type=str, default=None, help="File containing a user-defined binning. The name of the user-defined binning must be passed via the --binning_name parameter.")
+create.add_argument("--saveto", default='.', help="Directory where to save the resamplers as .pkl - files.")
+create.add_argument('-c', '--config', default="raw_data.json", help="Config-file with raw_data in it. Default: raw_data.json")
+create.add_argument('--use_trafo', action="store_true", help="Whether to use Trafo variables created with 'pidtool.py trafo_variables' before")
+
+
 
 resample = subparsers.add_parser('resample_branch', help='Uses histograms to add resampled PID branches to a dataset')
 resample.set_defaults(func=resample_branch)
@@ -221,4 +279,3 @@ resample.add_argument('--output_tree', help="Name of tree in output file. Sub-fo
 if __name__ == '__main__':
     options = parser.parse_args()
     options.func(options)
-
